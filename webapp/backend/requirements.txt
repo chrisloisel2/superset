@@ -1,0 +1,9 @@
+flask==3.0.3
+flask-cors==4.0.1
+pyhive==0.7.0
+thrift==0.16.0
+thrift-sasl==0.4.3
+pure-sasl==0.6.2
+gunicorn==22.0.0
+
+kubernetes==32.0.0
