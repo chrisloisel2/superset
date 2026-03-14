@@ -81,7 +81,7 @@ AWS_S3_BUCKET         = os.environ.get("AWS_S3_BUCKET", "")
 UPLOAD_FOLDER = "/app/superset_home/uploads/"
 ALLOWED_EXTENSIONS = {"csv", "tsv", "txt", "xlsx", "xls"}
 UPLOAD_ENABLED = True
-CSV_EXPORT = True
+CSV_EXPORT = {"encoding": "utf-8"}
 
 # ── Localisation ─────────────────────────────────────────────────────────────
 BABEL_DEFAULT_LOCALE = "fr"
