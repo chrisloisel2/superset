@@ -16,4 +16,4 @@ pymongo==4.6.1
 
 # ── Superset workers async ────────────────────────────────────────────────────
 gevent==24.2.1
-cachelib==0.10.2
+cachelib==0.9.0

@@ -64,6 +64,8 @@ services:
     ports:
       - "8088:8088"
     depends_on:
+      postgres:
+        condition: service_healthy
       superset-init:
         condition: service_completed_successfully
     environment:
