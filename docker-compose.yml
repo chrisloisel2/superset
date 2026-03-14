@@ -1,375 +1,87 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SuperHive — Superset + Hive uniquement
+# HiveServer2 externe : 192.168.88.5:20000 (via spool)
+# MongoDB externe     : 192.168.88.17:27017
+# ═══════════════════════════════════════════════════════════════════════════════
+
 services:
-  namenode:
-    platform: linux/amd64
-    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
-    container_name: namenode_red
-    restart: always
-    ports:
-      - 19870:9870
-      - 19000:9000
-    volumes:
-      - hadoop_namenode:/hadoop/dfs/name
-    environment:
-      - CLUSTER_NAME=test
-    env_file:
-      - ./hadoop.env
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9870"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
 
-  datanode:
-    platform: linux/amd64
-    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
-    container_name: datanode_red
-    restart: always
-    ports:
-      - 19864:9864
-    volumes:
-      - hadoop_datanode:/hadoop/dfs/data
-    environment:
-      SERVICE_PRECONDITION: "namenode:9870"
-    env_file:
-      - ./hadoop.env
-
-  resourcemanager:
-    platform: linux/amd64
-    image: bde2020/hadoop-resourcemanager:2.0.0-hadoop3.2.1-java8
-    container_name: resourcemanager_red
-    restart: always
-    ports:
-      - 18088:8088
-    environment:
-      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864"
-    env_file:
-      - ./hadoop.env
-
-  nodemanager1:
-    platform: linux/amd64
-    image: bde2020/hadoop-nodemanager:2.0.0-hadoop3.2.1-java8
-    container_name: nodemanager_red
-    restart: always
-    ports:
-      - 18042:8042
-    environment:
-      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
-    env_file:
-      - ./hadoop.env
-
-  historyserver:
-    platform: linux/amd64
-    image: bde2020/hadoop-historyserver:2.0.0-hadoop3.2.1-java8
-    container_name: historyserver_red
-    restart: always
-    ports:
-      - 18188:8188
-    environment:
-      SERVICE_PRECONDITION: "namenode:9000 namenode:9870 datanode:9864 resourcemanager:8088"
-    volumes:
-      - hadoop_historyserver:/hadoop/yarn/timeline
-    env_file:
-      - ./hadoop.env
-
-  kafka:
-    platform: linux/amd64
-    image: wurstmeister/kafka
-    container_name: kafka_red
-    ports:
-      - "19092:9092"
-      - "19093:9093"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://192.168.30.10:19093
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_CREATE_TOPICS: "topic1:20:1,topic2:1:1"
-      KAFKA_LOG_RETENTION_BYTES: 1073741824
-    depends_on:
-      - zookeeper
-    restart: always
-
-  zookeeper:
-    platform: linux/amd64
-    image: wurstmeister/zookeeper
-    container_name: zookeeper_red
-    ports:
-      - "12181:2181"
-
-  mongodb:
-    platform: linux/amd64
-    image: mongo:4.4
-    container_name: mongodb_red
-    restart: always
-    ports:
-      - "37017:27017"
-    volumes:
-      - mongodb_data:/data/db
-      - mongodb_config:/data/configdb
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
-
-  rabbitmq:
-    platform: linux/amd64
-    image: rabbitmq:3-management
-    container_name: rabbitmq_red
-    restart: always
-    ports:
-      - "25672:5672"
-      - "35672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-      - rabbitmq_logs:/var/log/rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: admin
-      RABBITMQ_DEFAULT_PASS: admin123
-      RABBITMQ_DEFAULT_VHOST: /
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
+  # ── PostgreSQL : meta-DB Superset ────────────────────────────────────────────
   postgres:
-    platform: linux/amd64
     image: postgres:13
-    container_name: hive-postgres_red
+    container_name: superhive_postgres
     restart: always
     environment:
-      POSTGRES_DB: metastore
-      POSTGRES_USER: hive
-      POSTGRES_PASSWORD: hive123
-    ports:
-      - "15432:5432"
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset123
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      test: ["CMD-SHELL", "pg_isready -U superset -d superset"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 15s
 
-  # ── Hive Metastore init ──────────────────────────────────────────────────────
-  hive-metastore-init:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile.hive
-    container_name: hive-metastore-init-red
-    restart: "no"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        export HADOOP_CLIENT_OPTS="-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver \
-          -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore \
-          -Djavax.jdo.option.ConnectionUserName=hive \
-          -Djavax.jdo.option.ConnectionPassword=hive123"
-        /opt/hive/bin/schematool -dbType postgres -info >/dev/null 2>&1 || \
-        /opt/hive/bin/schematool -dbType postgres -initSchema
-
-  # ── Hive Metastore ───────────────────────────────────────────────────────────
-  hive-metastore:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile.hive
-    container_name: hive-metastore-red
-    restart: always
-    depends_on:
-      hive-metastore-init:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      namenode:
-        condition: service_healthy
-    environment:
-      SERVICE_NAME: metastore
-      IS_RESUME: "true"
-      DB_DRIVER: postgres
-      SERVICE_OPTS: >-
-        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
-        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
-        -Djavax.jdo.option.ConnectionUserName=hive
-        -Djavax.jdo.option.ConnectionPassword=hive123
-      HADOOP_CLASSPATH: "/opt/tez/conf:/opt/tez/*:/opt/tez/lib/*:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-sdk-bundle.jar"
-      HDFS_CONF_fs_defaultFS: "hdfs://namenode:9000"
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-eu-west-1}"
-      SPOOL_HOST: "192.168.88.5"
-      HTTP_PROXY: "http://192.168.88.5:3128"
-      HTTPS_PROXY: "http://192.168.88.5:3128"
-    ports:
-      - "19083:9083"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-
-  # ── HiveServer2 ──────────────────────────────────────────────────────────────
-  hiveserver2:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile.hive
-    container_name: hiveserver2-red
-    restart: always
-    depends_on:
-      hive-metastore:
-        condition: service_healthy
-      namenode:
-        condition: service_healthy
-    environment:
-      SERVICE_NAME: hiveserver2
-      IS_RESUME: "true"
-      SERVICE_OPTS: "-Dhive.metastore.uris=thrift://hive-metastore:9083"
-      HDFS_CONF_fs_defaultFS: "hdfs://namenode:9000"
-      HADOOP_CLASSPATH: "/opt/tez/conf:/opt/tez/*:/opt/tez/lib/*:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-sdk-bundle.jar"
-      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
-      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
-      AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-eu-west-1}"
-      SPOOL_HOST: "192.168.88.5"
-      HTTP_PROXY: "http://192.168.88.5:3128"
-      HTTPS_PROXY: "http://192.168.88.5:3128"
-    ports:
-      - "20000:10000"
-      - "20002:10002"
-    volumes:
-      - ./scripts:/scripts:ro
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/10000'"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-
-  # ── Hive init (schéma robotics + tables) ────────────────────────────────────
-  hive-init:
-    platform: linux/amd64
-    build:
-      context: .
-      dockerfile: Dockerfile.hive
-    container_name: hive-init-red
-    restart: "no"
-    depends_on:
-      hiveserver2:
-        condition: service_healthy
-    entrypoint: ["/opt/hive/bin/beeline"]
-    command:
-      - "-u"
-      - "jdbc:hive2://hiveserver2:10000/default;auth=noSasl"
-      - "-f"
-      - "/scripts/create_partitioned_tables.sql"
-    volumes:
-      - ./hive_sql/create_partitioned_tables.sql:/scripts/create_partitioned_tables.sql:ro
-
-  # ── Apache Iceberg REST Catalog ──────────────────────────────────────────────
-  iceberg-rest:
-    platform: linux/amd64
-    image: tabulario/iceberg-rest:0.10.0
-    container_name: iceberg-rest_red
-    restart: always
-    ports:
-      - "18181:8181"
-    environment:
-      - CATALOG_WAREHOUSE=hdfs://namenode:9000/user/hive/iceberg
-      - CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO
-      - CATALOG_S3_ENDPOINT=http://namenode:9000
-    depends_on:
-      - postgres
-      - namenode
-
-  # ── Flask REST API ───────────────────────────────────────────────────────────
-  flask-api:
-    platform: linux/amd64
-    build:
-      context: ./webapp/backend
-      dockerfile: Dockerfile
-    container_name: flask_api_red
-    restart: always
-    ports:
-      - "25000:5000"
-    environment:
-      HIVE_HOST: hiveserver2
-      HIVE_PORT: "10000"
-      HIVE_DATABASE: robotics
-      HIVE_AUTH: NOSASL
-      HIVE_SOCKET_TIMEOUT_SECONDS: "12"
-      CORS_ALLOWED_ORIGINS: "*"
-    depends_on:
-      hiveserver2:
-        condition: service_healthy
-      hive-init:
-        condition: service_completed_successfully
-    volumes:
-      - ./scripts:/scripts
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  # ── Superset init ────────────────────────────────────────────────────────────
+  # ── Superset init (schéma DB + admin) ────────────────────────────────────────
   superset-init:
-    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: superset_init_red
+    container_name: superhive_init
     restart: "no"
     depends_on:
       postgres:
-        condition: service_healthy
-      hiveserver2:
         condition: service_healthy
     environment:
       SERVICE_NAME: superset-init
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
       SUPERSET_SECRET_KEY: "hadoop_red_superset_secret_2024!"
-      SUPERSET_DB_URI: "postgresql+psycopg2://hive:hive123@postgres:5432/superset"
+      SUPERSET_DB_URI: "postgresql+psycopg2://superset:superset123@postgres:5432/superset"
       SUPERSET_ADMIN_PASSWORD: "Admin123456"
+      # Hive externe via spool
+      HIVE_HOST: "192.168.88.5"
+      HIVE_PORT: "20000"
+      # MongoDB externe
       MONGODB_URI: "mongodb://admin:admin123@192.168.88.17:27017/"
+      # AWS S3
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-eu-west-1}"
       AWS_S3_BUCKET: "${AWS_S3_BUCKET}"
-      SPOOL_HOST: "192.168.88.5"
+      # Spool proxy
       HTTP_PROXY: "http://192.168.88.5:3128"
       HTTPS_PROXY: "http://192.168.88.5:3128"
 
-  # ── Superset webserver ───────────────────────────────────────────────────────
+  # ── Superset webserver ────────────────────────────────────────────────────────
   superset:
-    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: superset_red
+    container_name: superhive_superset
     restart: always
     ports:
-      - "28088:8088"
+      - "8088:8088"
     depends_on:
       superset-init:
         condition: service_completed_successfully
-      hiveserver2:
-        condition: service_healthy
     environment:
       SERVICE_NAME: superset
       SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
       SUPERSET_SECRET_KEY: "hadoop_red_superset_secret_2024!"
-      SUPERSET_DB_URI: "postgresql+psycopg2://hive:hive123@postgres:5432/superset"
+      SUPERSET_DB_URI: "postgresql+psycopg2://superset:superset123@postgres:5432/superset"
+      # Hive externe via spool
+      HIVE_HOST: "192.168.88.5"
+      HIVE_PORT: "20000"
+      # MongoDB externe
       MONGODB_URI: "mongodb://admin:admin123@192.168.88.17:27017/"
+      # AWS S3
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_DEFAULT_REGION: "${AWS_DEFAULT_REGION:-eu-west-1}"
       AWS_S3_BUCKET: "${AWS_S3_BUCKET}"
-      SPOOL_HOST: "192.168.88.5"
+      # Spool proxy
       HTTP_PROXY: "http://192.168.88.5:3128"
       HTTPS_PROXY: "http://192.168.88.5:3128"
     volumes:
@@ -381,32 +93,10 @@ services:
       retries: 5
       start_period: 60s
 
-  # ── React Frontend ───────────────────────────────────────────────────────────
-  react-frontend:
-    platform: linux/amd64
-    build:
-      context: ./webapp/frontend
-      dockerfile: Dockerfile
-      args:
-        VITE_API_URL: http://localhost:25000
-    container_name: react_frontend_red
-    restart: always
-    ports:
-      - "23000:80"
-    depends_on:
-      - flask-api
-
 volumes:
-  hadoop_namenode:
-  hadoop_datanode:
-  hadoop_historyserver:
-  mongodb_data:
-  mongodb_config:
-  rabbitmq_data:
-  rabbitmq_logs:
   postgres_data:
   superset_home:
 
 networks:
   default:
-    name: hadoop-red-version-default
+    name: superhive-network

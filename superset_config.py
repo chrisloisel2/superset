@@ -1,19 +1,22 @@
 """
-SuperHive — configuration unique Superset
-Hive · MongoDB · AWS S3 · Spool 192.168.88.5 · Embed 192.168.88.27:23000
+SuperHive — configuration Superset
+Hive externe : 192.168.88.5:20000 (spool)
+MongoDB      : 192.168.88.17:27017
+AWS S3       : via variables d'env
+Embed        : http://192.168.88.27:23000
 """
 import os
 
 # ── Sécurité ──────────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get("SUPERSET_SECRET_KEY", "hadoop_red_superset_secret_2024!")
 
-# ── Meta-DB Superset (PostgreSQL partagé avec Hive metastore) ─────────────────
+# ── Meta-DB Superset (PostgreSQL local) ───────────────────────────────────────
 SQLALCHEMY_DATABASE_URI = os.environ.get(
     "SUPERSET_DB_URI",
-    "postgresql+psycopg2://hive:hive123@postgres:5432/superset",
+    "postgresql+psycopg2://superset:superset123@postgres:5432/superset",
 )
 
-# ── Cache simple (pas de Redis nécessaire) ────────────────────────────────────
+# ── Cache ─────────────────────────────────────────────────────────────────────
 CACHE_CONFIG = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 300}
 DATA_CACHE_CONFIG = CACHE_CONFIG
 
@@ -27,7 +30,7 @@ WTF_CSRF_ENABLED = True
 WTF_CSRF_EXEMPT_LIST = ["superset.views.core.log", "superset.charts.api.data"]
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = False
-SESSION_COOKIE_SAMESITE = "None"   # cross-origin iframe
+SESSION_COOKIE_SAMESITE = "None"
 TALISMAN_ENABLED = False
 
 # ── CORS : autoriser le site web ──────────────────────────────────────────────
@@ -42,7 +45,7 @@ CORS_OPTIONS = {
     ],
 }
 
-# ── CSP : autoriser l'iframe depuis le site web ───────────────────────────────
+# ── CSP : autoriser l'iframe ──────────────────────────────────────────────────
 TALISMAN_CONFIG = {
     "force_https": False,
     "content_security_policy": {
@@ -60,12 +63,15 @@ FEATURE_FLAGS = {
     "ALERT_REPORTS": False,
 }
 
-# ── Proxy sortant via spool (192.168.88.5) ────────────────────────────────────
-_spool = os.environ.get("SPOOL_HOST", "192.168.88.5")
-HTTP_PROXY  = os.environ.get("HTTP_PROXY",  f"http://{_spool}:3128")
-HTTPS_PROXY = os.environ.get("HTTPS_PROXY", f"http://{_spool}:3128")
+# ── Connexion Hive (HiveServer2 via spool 192.168.88.5:20000) ─────────────────
+_hive_host = os.environ.get("HIVE_HOST", "192.168.88.5")
+_hive_port = os.environ.get("HIVE_PORT", "20000")
+HIVE_SQLALCHEMY_URI = f"hive://{_hive_host}:{_hive_port}/robotics?auth=NONE"
 
-# ── AWS S3 (boto3 / s3fs utilisés par Superset pour les uploads vers S3) ──────
+# ── Connexion MongoDB (192.168.88.17:27017) ───────────────────────────────────
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://admin:admin123@192.168.88.17:27017/")
+
+# ── AWS S3 ────────────────────────────────────────────────────────────────────
 AWS_ACCESS_KEY_ID     = os.environ.get("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION    = os.environ.get("AWS_DEFAULT_REGION", "eu-west-1")
@@ -81,6 +87,5 @@ CSV_EXPORT = True
 BABEL_DEFAULT_LOCALE = "fr"
 BABEL_DEFAULT_TIMEZONE = "Europe/Paris"
 
-# ── Async ─────────────────────────────────────────────────────────────────────
 RESULTS_BACKEND = None
 ENABLE_TIME_ROTATE = False
