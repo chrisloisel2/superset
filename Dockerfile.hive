@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# SuperHive — Hive 3.1.3 + Tez 0.10.2
+# Drivers : S3A (hadoop-aws) · PostgreSQL metastore · NOSASL
+# Spool : 192.168.88.5 · AWS S3
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Stage 1 : télécharge les JARs S3A (couche cachée) ────────────────────────
+FROM alpine:3.19 AS jars
+RUN apk add --no-cache curl
+RUN mkdir /jars && \
+    curl -fsSL -o /jars/hadoop-aws.jar \
+      https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.2.1/hadoop-aws-3.2.1.jar && \
+    curl -fsSL -o /jars/aws-sdk-bundle.jar \
+      https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.901/aws-java-sdk-bundle-1.11.901.jar
+
+# ── Stage 2 : image Hive + Tez ───────────────────────────────────────────────
+FROM apache/hive:3.1.3
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget curl netcat-openbsd python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# JARs S3A
+COPY --from=jars /jars/hadoop-aws.jar     /opt/hive/lib/
+COPY --from=jars /jars/aws-sdk-bundle.jar /opt/hive/lib/
+
+# Tez
+ENV TEZ_VERSION=0.10.2 \
+    TEZ_HOME=/opt/tez \
+    TEZ_CONF_DIR=/opt/tez/conf
+
+RUN wget -q -O /tmp/tez.tar.gz \
+      https://archive.apache.org/dist/tez/${TEZ_VERSION}/apache-tez-${TEZ_VERSION}-bin.tar.gz && \
+    mkdir -p ${TEZ_HOME} ${TEZ_CONF_DIR} && \
+    tar -xzf /tmp/tez.tar.gz -C ${TEZ_HOME} --strip-components=1 && \
+    rm /tmp/tez.tar.gz
+
+COPY tez-site.xml ${TEZ_CONF_DIR}/tez-site.xml
+
+# hive-site.xml : Tez + NOSASL + S3A via variables d'env
+RUN sed -i 's|</configuration>|\
+  <property><name>hive.execution.engine</name><value>tez</value></property>\n\
+  <property><name>hive.tez.container.size</name><value>512</value></property>\n\
+  <property><name>hive.server2.authentication</name><value>NOSASL</value></property>\n\
+  <property><name>fs.s3a.access.key</name><value>${env.AWS_ACCESS_KEY_ID}</value></property>\n\
+  <property><name>fs.s3a.secret.key</name><value>${env.AWS_SECRET_ACCESS_KEY}</value></property>\n\
+  <property><name>fs.s3a.path.style.access</name><value>true</value></property>\n\
+  <property><name>fs.s3a.connection.ssl.enabled</name><value>true</value></property>\n\
+</configuration>|' /opt/hive/conf/hive-site.xml
+
+RUN ln -sf /opt/hadoop/bin/hdfs /usr/local/bin/hdfs
+
+ENV HADOOP_CLASSPATH="/opt/tez/conf:/opt/tez/*:/opt/tez/lib/*:/opt/hive/lib/hadoop-aws.jar:/opt/hive/lib/aws-sdk-bundle.jar"
+
+# Script init Tez dans HDFS (idempotent)
+RUN cat > /opt/init-tez-hdfs.sh <<'EOF'
+#!/bin/bash
+until hdfs dfs -test -d / 2>/dev/null; do sleep 5; done
+hdfs dfs -mkdir -p /apps/tez
+if ! hdfs dfs -test -e /apps/tez/tez-0.10.2.tar.gz; then
+    cd /opt && tar -czf tez-0.10.2.tar.gz -C tez .
+    hdfs dfs -put tez-0.10.2.tar.gz /apps/tez/
+    hdfs dfs -chmod -R 755 /apps/tez
+fi
+EOF
+RUN chmod +x /opt/init-tez-hdfs.sh
+
+# Entrypoint Hive
+RUN cat > /opt/hive-entrypoint.sh <<'EOF'
+#!/bin/bash
+set -e
+[ "$SERVICE_NAME" = "metastore" ] || [ "$SERVICE_NAME" = "hiveserver2" ] && /opt/init-tez-hdfs.sh &
+if [ "$SERVICE_NAME" = "hiveserver2" ] && ! grep -q "hive.metastore.uris" /opt/hive/conf/hive-site.xml 2>/dev/null; then
+    sed -i 's|</configuration>|  <property><name>hive.metastore.uris</name><value>thrift://hive-metastore:9083</value></property>\n</configuration>|' \
+        /opt/hive/conf/hive-site.xml
+fi
+exec /entrypoint.sh "$@"
+EOF
+RUN chmod +x /opt/hive-entrypoint.sh
+
+ENTRYPOINT ["/opt/hive-entrypoint.sh"]
