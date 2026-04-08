@@ -294,7 +294,7 @@ def flush_sessions(cur, rows: list[dict]) -> None:
             layer, session_id, source_path, scenario,
             start_time, end_time, trigger_time, duration_seconds,
             failed, video_width, video_height, video_fps,
-            synced_at, metadata_json
+            metadata_json
         )
         VALUES %s
         ON CONFLICT (layer, session_id) DO UPDATE SET
@@ -326,7 +326,6 @@ def flush_sessions(cur, rows: list[dict]) -> None:
             r["video_width"],
             r["video_height"],
             r["video_fps"],
-            None,
             r["metadata_json"],
         )
         for r in rows
@@ -341,7 +340,7 @@ def flush_cameras(cur, rows: list[tuple]) -> None:
 
     sql = """
         INSERT INTO hdd_cameras (
-            layer, session_id, camera_key, name, position, serial, synced_at
+            layer, session_id, camera_key, name, position, serial
         )
         VALUES %s
         ON CONFLICT (layer, session_id, camera_key) DO UPDATE SET
@@ -350,8 +349,7 @@ def flush_cameras(cur, rows: list[tuple]) -> None:
             serial    = EXCLUDED.serial,
             synced_at = NOW()
     """
-    values = [(*r, None) for r in rows]
-    execute_values(cur, sql, values, page_size=PG_BATCH_SIZE)
+    execute_values(cur, sql, rows, page_size=PG_BATCH_SIZE)
 
 
 def flush_trackers(cur, rows: list[tuple]) -> None:
@@ -360,7 +358,7 @@ def flush_trackers(cur, rows: list[tuple]) -> None:
 
     sql = """
         INSERT INTO hdd_trackers (
-            layer, session_id, tracker_key, serial, model, synced_at
+            layer, session_id, tracker_key, serial, model
         )
         VALUES %s
         ON CONFLICT (layer, session_id, tracker_key) DO UPDATE SET
@@ -368,8 +366,7 @@ def flush_trackers(cur, rows: list[tuple]) -> None:
             model     = EXCLUDED.model,
             synced_at = NOW()
     """
-    values = [(*r, None) for r in rows]
-    execute_values(cur, sql, values, page_size=PG_BATCH_SIZE)
+    execute_values(cur, sql, rows, page_size=PG_BATCH_SIZE)
 
 
 def extract_camera_rows(layer: str, session_id: str, cameras: dict) -> list[tuple]:

@@ -1,0 +1,11 @@
+# Sessions de capture (données brutes, ne pas versionner)
+session_*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Env
+.env
+*.env
