@@ -24,6 +24,7 @@ from io import BytesIO
 
 import paramiko
 import psycopg2
+import requests
 from psycopg2.extras import execute_values
 
 logging.basicConfig(
@@ -49,6 +50,10 @@ PG_DSN = os.environ.get(
     "ROBOTICS_DB_URI",
     "postgresql://superset:superset123@postgres:5432/robotics",
 )
+
+SUPERSET_URL  = os.environ.get("SUPERSET_URL",      "http://superset:8088")
+SUPERSET_USER = os.environ.get("SUPERSET_USER",     "admin")
+SUPERSET_PASS = os.environ.get("SUPERSET_PASSWORD", "Admin123456")
 
 # ── SFTP helpers ──────────────────────────────────────────────────────────────
 
@@ -168,6 +173,77 @@ def parse_metadata(meta: dict, layer: str) -> dict:
         "layer":            layer,
     }
 
+# ── Enregistrement Superset (DB + datasets) ───────────────────────────────────
+
+def register_superset():
+    """Enregistre la base 'HDD Robotics' et ses datasets dans Superset.
+    Retourne silencieusement si Superset n'est pas encore disponible."""
+    try:
+        sess = requests.Session()
+
+        # Login
+        resp = sess.post(f"{SUPERSET_URL}/api/v1/security/login", json={
+            "username": SUPERSET_USER,
+            "password": SUPERSET_PASS,
+            "provider": "db",
+            "refresh": True,
+        }, timeout=10)
+        token = resp.json().get("access_token")
+        if not token:
+            log.warning("Superset login échoué, registration ignorée.")
+            return
+
+        headers = {"Authorization": f"Bearer {token}"}
+        csrf = sess.get(f"{SUPERSET_URL}/api/v1/security/csrf_token/", headers=headers, timeout=10)
+        headers["X-CSRFToken"] = csrf.json().get("result", "")
+        headers["Referer"] = SUPERSET_URL
+
+        # Enregistrer la base robotics
+        dbs = sess.get(f"{SUPERSET_URL}/api/v1/database/", headers=headers, timeout=10).json()
+        existing = [d for d in dbs.get("result", []) if d.get("database_name") == "HDD Robotics"]
+        if not existing:
+            r = sess.post(f"{SUPERSET_URL}/api/v1/database/", headers=headers, timeout=10, json={
+                "database_name": "HDD Robotics",
+                "sqlalchemy_uri": "postgresql+psycopg2://superset:superset123@postgres:5432/robotics",
+                "expose_in_sqllab": True,
+                "allow_run_async": True,
+                "allow_dml": False,
+            })
+            if r.status_code in (200, 201):
+                db_id = r.json()["id"]
+                log.info("Base 'HDD Robotics' enregistrée dans Superset (id=%s)", db_id)
+            else:
+                log.warning("Erreur enregistrement DB Superset : %s", r.text)
+                return
+        else:
+            db_id = existing[0]["id"]
+            log.info("Base 'HDD Robotics' déjà présente dans Superset (id=%s)", db_id)
+
+        # Enregistrer les datasets
+        for table_name in ("hdd_sessions", "hdd_cameras", "hdd_trackers", "v_sessions_full"):
+            ds = sess.get(
+                f"{SUPERSET_URL}/api/v1/dataset/",
+                params={"q": json.dumps({"filters": [{"col": "table_name", "opr": "eq", "val": table_name}]})},
+                headers=headers,
+                timeout=10,
+            ).json()
+            if ds.get("count", 0) == 0:
+                r = sess.post(f"{SUPERSET_URL}/api/v1/dataset/", headers=headers, timeout=10, json={
+                    "database": db_id,
+                    "schema": "public",
+                    "table_name": table_name,
+                })
+                if r.status_code in (200, 201):
+                    log.info("Dataset '%s' enregistré dans Superset.", table_name)
+                else:
+                    log.warning("Erreur dataset '%s': %s", table_name, r.text)
+            else:
+                log.info("Dataset '%s' déjà présent.", table_name)
+
+    except Exception as e:
+        log.warning("Registration Superset ignorée (%s) — sera retentée au prochain cycle.", e)
+
+
 # ── Sync principal ────────────────────────────────────────────────────────────
 
 def sync_once() -> int:
@@ -217,6 +293,17 @@ def main():
     parser.add_argument("--watch", action="store_true", help="Boucle continue")
     parser.add_argument("--interval", type=int, default=60, help="Intervalle en secondes (défaut: 60)")
     args = parser.parse_args()
+
+    # Attendre que Superset soit prêt puis enregistrer DB + datasets
+    log.info("Attente de Superset (%s)…", SUPERSET_URL)
+    for _ in range(24):  # max 2 min
+        try:
+            if requests.get(f"{SUPERSET_URL}/health", timeout=5).status_code == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(5)
+    register_superset()
 
     if args.watch:
         log.info("Mode watch — intervalle %ds", args.interval)

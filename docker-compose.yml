@@ -118,6 +118,9 @@ services:
       HDD_GOLD:   "/mnt/storage/gold"
       HDD_INBOX:  "/mnt/inbox"
       ROBOTICS_DB_URI: "postgresql://superset:superset123@postgres:5432/robotics"
+      SUPERSET_URL: "http://superset:8088"
+      SUPERSET_USER: "admin"
+      SUPERSET_PASSWORD: "Admin123456"
       SYNC_INTERVAL: "60"
     command: ["python3", "/app/scripts/sftp_sync.py", "--watch", "--interval", "60"]
 
