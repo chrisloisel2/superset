@@ -460,7 +460,7 @@ def register_superset() -> None:
                     "database_name": SUPERSET_DB_NAME,
                     "sqlalchemy_uri": SUPERSET_DB_URI,
                     "expose_in_sqllab": True,
-                    "allow_run_async": True,
+                    "allow_run_async": False,
                     "allow_dml": False,
                 },
             )
