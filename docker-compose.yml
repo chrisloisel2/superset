@@ -95,6 +95,32 @@ services:
       retries: 5
       start_period: 60s
 
+  # ── SFTP Sync : HDD → PostgreSQL (robotics) ──────────────────────────────────
+  sftp-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: superhive_sftp_sync
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+    environment:
+      SERVICE_NAME: sftp-sync
+      HDD_HOST: "192.168.88.82"
+      HDD_PORT: "22"
+      HDD_USER: "exoria"
+      HDD_PASSWORD: "Admin123456"
+      HDD_BRONZE: "/mnt/storage/bronze"
+      HDD_SILVER: "/mnt/storage/silver"
+      HDD_GOLD:   "/mnt/storage/gold"
+      HDD_INBOX:  "/mnt/inbox"
+      ROBOTICS_DB_URI: "postgresql://superset:superset123@postgres:5432/robotics"
+      SYNC_INTERVAL: "60"
+    command: ["python3", "/app/scripts/sftp_sync.py", "--watch", "--interval", "60"]
+
 volumes:
   postgres_data:
   superset_home:
