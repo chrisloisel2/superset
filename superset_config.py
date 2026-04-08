@@ -30,8 +30,13 @@ WTF_CSRF_ENABLED = True
 WTF_CSRF_EXEMPT_LIST = ["superset.views.core.log", "superset.charts.api.data"]
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = False
-SESSION_COOKIE_SAMESITE = "None"
+SESSION_COOKIE_SAMESITE = "Lax"
 TALISMAN_ENABLED = False
+RESULTS_BACKEND = None
+ENABLE_TIME_ROTATE = False
+WTF_CSRF_SSL_STRICT = False
+ENABLE_PROXY_FIX = True
+SECRET_KEY = "hadoop_red_superset_secret_2024!"
 
 # ── CORS : autoriser le site web ──────────────────────────────────────────────
 ENABLE_CORS = True
@@ -86,6 +91,3 @@ CSV_EXPORT = {"encoding": "utf-8"}
 # ── Localisation ─────────────────────────────────────────────────────────────
 BABEL_DEFAULT_LOCALE = "fr"
 BABEL_DEFAULT_TIMEZONE = "Europe/Paris"
-
-RESULTS_BACKEND = None
-ENABLE_TIME_ROTATE = False
