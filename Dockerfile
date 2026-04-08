@@ -17,6 +17,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY superset_config.py /app/pythonpath/superset_config.py
+COPY scripts/ /app/scripts/
 COPY entrypoint.sh /superhive-entrypoint.sh
 RUN chmod +x /superhive-entrypoint.sh && \
     mkdir -p /app/superset_home/uploads && \

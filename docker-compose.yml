@@ -123,7 +123,6 @@ services:
       SUPERSET_USER: "admin"
       SUPERSET_PASSWORD: "Admin123456"
       SYNC_INTERVAL: "60"
-    command: ["python3", "/app/scripts/sftp_sync.py", "--watch", "--interval", "60"]
 
 volumes:
   postgres_data:

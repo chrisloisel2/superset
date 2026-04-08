@@ -14,6 +14,10 @@ case "${SERVICE_NAME}" in
     superset init
     ;;
 
+  sftp-sync)
+    exec python3 /app/scripts/sftp_sync.py --watch --interval "${SYNC_INTERVAL:-60}"
+    ;;
+
   *)
     exec gunicorn \
       --bind 0.0.0.0:8088 \
