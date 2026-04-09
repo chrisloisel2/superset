@@ -555,6 +555,23 @@ def wait_for_superset(max_wait: int = 120) -> None:
 
 
 def ensure_database_ready() -> None:
+    # Étape 1 : créer la base robotics si elle n'existe pas
+    # On se connecte à la base 'superset' (toujours présente) en autocommit
+    admin_dsn = PG_DSN.replace("/robotics", "/superset")
+    pg = psycopg2.connect(admin_dsn)
+    pg.autocommit = True
+    try:
+        with pg.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = 'robotics'")
+            if not cur.fetchone():
+                cur.execute("CREATE DATABASE robotics OWNER superset")
+                log.info("Base 'robotics' créée.")
+            else:
+                log.info("Base 'robotics' déjà présente.")
+    finally:
+        pg.close()
+
+    # Étape 2 : créer les tables et index dans robotics
     pg = pg_connect()
     try:
         with pg:

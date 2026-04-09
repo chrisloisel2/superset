@@ -117,6 +117,7 @@ services:
       HDD_SILVER: "/mnt/storage/silver"
       HDD_GOLD:   "/mnt/storage/gold"
       HDD_INBOX:  "/mnt/inbox"
+      SFTP_WORKERS: "8"
       PG_BATCH_SIZE: "500"
       ROBOTICS_DB_URI: "postgresql://superset:superset123@postgres:5432/robotics"
       SUPERSET_URL: "http://superset:8088"
