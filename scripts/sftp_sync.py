@@ -161,24 +161,32 @@ def find_all_metadata_parallel() -> dict[str, list[str]]:
 
     t0 = time.perf_counter()
 
+    dirs_scanned = 0
+
     with ThreadPoolExecutor(max_workers=SFTP_WORKERS, thread_name_prefix="sftp-scan") as ex:
 
         # Amorce : soumet les racines de toutes les layers
         for layer, base in LAYERS:
             f = ex.submit(_scan_dir, base, 0)
             futures[f] = (layer, base)
+        log.info("Scan démarré sur %d layers avec %d workers…", len(LAYERS), SFTP_WORKERS)
 
         while futures:
             done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
             new_futures: dict = {}
             for f in done:
                 layer, path = futures.pop(f)
+                dirs_scanned += 1
                 try:
                     subdirs, meta_paths = f.result()
                     layer_paths[layer].extend(meta_paths)
                     for subdir, depth in subdirs:
                         nf = ex.submit(_scan_dir, subdir, depth)
                         new_futures[nf] = (layer, subdir)
+                    if dirs_scanned % 20 == 0:
+                        found_so_far = sum(len(v) for v in layer_paths.values())
+                        log.info("  … %d dossiers scannés, %d metadata.json trouvés, %d en attente",
+                                 dirs_scanned, found_so_far, len(futures) + len(new_futures))
                 except Exception as e:
                     log.warning("Erreur scan %s : %s", path, e)
             futures.update(new_futures)
@@ -532,9 +540,14 @@ def register_superset() -> None:
                 if r.status_code in (200, 201):
                     log.info("Dataset '%s' enregistré.", table_name)
                 else:
-                    log.warning("Erreur dataset '%s': %s", table_name, r.text)
+                    # "already exists" = déjà présent via une autre registration, pas une erreur
+                    msg = r.text
+                    if "already exists" in msg:
+                        log.debug("Dataset '%s' déjà présent (conflit ignoré).", table_name)
+                    else:
+                        log.warning("Erreur dataset '%s': %s", table_name, msg)
             else:
-                log.info("Dataset '%s' déjà présent.", table_name)
+                log.debug("Dataset '%s' déjà présent.", table_name)
 
     except Exception as e:
         log.warning("Registration Superset ignorée (%s)", e)
