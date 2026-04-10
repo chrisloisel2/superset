@@ -24,6 +24,7 @@ Mongo :
 """
 
 import argparse
+import math
 import json
 import logging
 import os
@@ -933,8 +934,20 @@ def create_schema(cur) -> None:
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
 
+def _sanitize(obj):
+    """Remplace récursivement NaN/Inf par None (invalides en JSONB PostgreSQL)."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def parse_metadata(meta: dict, layer: str, source_path: str, fallback: str) -> dict:
     vc = meta.get("video_config") or {}
+    clean = _sanitize(meta)
     return {
         "layer":            layer,
         "session_id":       meta.get("session_id") or fallback,
@@ -948,7 +961,7 @@ def parse_metadata(meta: dict, layer: str, source_path: str, fallback: str) -> d
         "video_width":      vc.get("width"),
         "video_height":     vc.get("height"),
         "video_fps":        vc.get("fps"),
-        "metadata_json":    json.dumps(meta, ensure_ascii=False),
+        "metadata_json":    json.dumps(clean, ensure_ascii=False),
     }
 
 
