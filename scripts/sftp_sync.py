@@ -48,6 +48,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 HDD_HOST     = os.environ.get("HDD_HOST",     "192.168.88.82")
@@ -174,6 +175,176 @@ def parse_timestamp(value):
 
 
 # ── Phase 1 : BFS parallèle avec collecte mtime ───────────────────────────────
+
+def load_cache() -> dict[str, float]:
+    """Charge tout hdd_scan_cache en mémoire → {path: mtime}. O(1) lookup ensuite."""
+    pg = pg_connect()
+    try:
+        with pg.cursor() as cur:
+            cur.execute("SELECT path, mtime FROM hdd_scan_cache")
+            cache = {row[0]: row[1] for row in cur.fetchall()}
+        log.info("Cache chargé : %d entrées", len(cache))
+        return cache
+    finally:
+        pg.close()
+
+
+def _scan_and_read(
+    path: str,
+    depth: int,
+    layer: str,
+    cache: dict[str, float],
+) -> tuple[list[tuple[str, int, str]], list[tuple[str, float, dict]]]:
+    """
+    Worker unifié BFS + lecture immédiate.
+    - Liste le répertoire
+    - Pour chaque metadata.json : vérifie mtime vs cache en mémoire
+      → si nouveau/modifié : lit et parse immédiatement
+    Retourne :
+      subdirs  : [(path, depth, layer), ...]
+      sessions : [(path, mtime, meta_dict), ...]
+    """
+    if depth > SFTP_MAX_DEPTH:
+        return [], []
+    sftp = _get_sftp()
+    try:
+        entries = sftp.listdir_attr(path)
+    except Exception as e:
+        log.warning("listdir %s : %s", path, e)
+        return [], []
+
+    subdirs:  list[tuple[str, int, str]]     = []
+    sessions: list[tuple[str, float, dict]]  = []
+
+    for entry in entries:
+        full = posixpath.join(path, entry.filename)
+        try:
+            if S_ISDIR(entry.st_mode):
+                subdirs.append((full, depth + 1, layer))
+            elif entry.filename == "metadata.json":
+                mtime = float(entry.st_mtime or 0)
+                cached = cache.get(full)
+                if cached is not None and abs(cached - mtime) <= 1:
+                    continue  # déjà traité, même mtime → skip
+                try:
+                    buf = BytesIO()
+                    sftp.getfo(full, buf)
+                    meta = json.loads(buf.getvalue().decode("utf-8"))
+                    sessions.append((full, mtime, meta))
+                except FileNotFoundError:
+                    log.debug("Disparu : %s", full)
+                except Exception as e:
+                    log.warning("Lecture %s : %s", full, e)
+        except Exception:
+            pass
+    return subdirs, sessions
+
+
+def _hdd_sync_pipeline(flush_size: int = 200) -> int:
+    """
+    Pipeline unifié : BFS + lecture + INSERT en une seule boucle.
+    Les données sont flushées en base tous les `flush_size` sessions
+    PENDANT le scan, sans attendre la fin du BFS.
+    """
+    cache = load_cache()
+
+    session_buf: list[dict]              = []
+    camera_buf:  list[tuple]             = []
+    tracker_buf: list[tuple]             = []
+    cache_buf:   list[tuple[str, float]] = []
+
+    total_sessions = 0
+    dirs_done      = 0
+    last_log       = time.perf_counter()
+    pending: dict  = {}
+
+    pg  = pg_connect()
+    cur = pg.cursor()
+
+    def _flush(force: bool = False) -> None:
+        nonlocal total_sessions
+        if not force and len(session_buf) < flush_size:
+            return
+        if not session_buf:
+            return
+        try:
+            flush_sessions(cur, session_buf)
+            pg.commit()
+            flush_cameras(cur, camera_buf)
+            pg.commit()
+            flush_trackers(cur, tracker_buf)
+            pg.commit()
+            # Mise à jour cache dans la même transaction
+            execute_values(cur, """
+                INSERT INTO hdd_scan_cache (path, mtime, synced_at) VALUES %s
+                ON CONFLICT (path) DO UPDATE SET mtime=EXCLUDED.mtime, synced_at=NOW()
+            """, cache_buf, page_size=PG_BATCH_SIZE)
+            pg.commit()
+            total_sessions += len(session_buf)
+            log.info("Flush +%d sessions (total %d) | dirs: %d | en file: %d",
+                     len(session_buf), total_sessions, dirs_done, len(pending))
+            session_buf.clear(); camera_buf.clear()
+            tracker_buf.clear(); cache_buf.clear()
+        except Exception as e:
+            pg.rollback()
+            log.error("Erreur flush : %s", e)
+            raise
+
+    try:
+        with ThreadPoolExecutor(max_workers=SFTP_WORKERS, thread_name_prefix="sftp") as ex:
+            for layer, base in LAYERS:
+                f = ex.submit(_scan_and_read, base, 0, layer, cache)
+                pending[f] = (layer, base)
+            log.info("Pipeline BFS+lecture démarré — %d layers, %d workers, flush/%d",
+                     len(LAYERS), SFTP_WORKERS, flush_size)
+
+            while pending:
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                new: dict = {}
+                for f in done:
+                    layer, path = pending.pop(f)
+                    dirs_done += 1
+                    try:
+                        subdirs, sessions = f.result()
+                        for sp, d, sl in subdirs:
+                            nf = ex.submit(_scan_and_read, sp, d, sl, cache)
+                            new[nf] = (sl, sp)
+                        for spath, mtime, meta in sessions:
+                            fallback = posixpath.basename(posixpath.dirname(spath))
+                            row = parse_metadata(meta, layer, spath, fallback)
+                            sid = row["session_id"]
+                            session_buf.append(row)
+                            camera_buf.extend([
+                                (layer, sid, str(k), c.get("name"), c.get("position"), c.get("serial"))
+                                for k, c in (meta.get("cameras") or {}).items()
+                            ])
+                            tracker_buf.extend([
+                                (layer, sid, str(k), t.get("serial"), t.get("model"))
+                                for k, t in (meta.get("trackers") or {}).items()
+                            ])
+                            cache_buf.append((spath, mtime))
+                    except Exception as e:
+                        log.warning("Worker %s : %s", path, e)
+                pending.update(new)
+
+                if time.perf_counter() - last_log >= 30:
+                    log.info("  … dirs: %d | buf: %d sessions | en file: %d",
+                             dirs_done, len(session_buf), len(pending))
+                    last_log = time.perf_counter()
+
+                _flush(force=False)
+
+        _flush(force=True)
+        cur.close()
+    except Exception:
+        pg.rollback()
+        raise
+    finally:
+        pg.close()
+
+    log.info("HDD pipeline terminé — %d sessions insérées", total_sessions)
+    return total_sessions
+
 
 def _scan_dir(path: str, depth: int) -> tuple[list[tuple[str, int]], list[tuple[str, float]]]:
     if depth > SFTP_MAX_DEPTH:
@@ -1054,17 +1225,7 @@ def sync_mongo_once() -> None:
 def sync_once() -> int:
     t0 = time.perf_counter()
 
-    layer_results = find_all_metadata_parallel()
-    total_found = sum(len(v) for v in layer_results.values())
-    if total_found == 0:
-        log.info("Aucun metadata.json trouvé.")
-    else:
-        filtered = filter_new_or_changed(layer_results)
-        total_new = sum(len(v) for v in filtered.values())
-        if total_new == 0:
-            log.info("Aucun fichier nouveau ou modifié — sync HDD ignoré.")
-        else:
-            read_and_flush_pipeline(filtered, flush_size=200)
+    _hdd_sync_pipeline(flush_size=200)
 
     # Sync Mongo à chaque exécution
     sync_mongo_once()
