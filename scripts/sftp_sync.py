@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sftp_sync.py  —  sync incrémental haute performance
-====================================================
+sftp_sync.py  —  sync incrémental haute performance + mapping MongoDB -> PostgreSQL
+===================================================================================
 
-Première exécution : lit tous les metadata.json (peut prendre du temps).
-Exécutions suivantes : lit UNIQUEMENT les fichiers nouveaux ou modifiés
-  (comparaison mtime SFTP vs cache PostgreSQL → en général quelques secondes).
-
-Phases :
-  1. BFS parallèle sur toutes les layers → collecte (path, mtime)
-  2. Filtre contre hdd_scan_cache → garde seulement les nouveautés
-  3. Lecture parallèle des seuls fichiers filtrés
-  4. Déduplication + batch INSERT PostgreSQL
-  5. Mise à jour du cache
+Fonctions :
+  1. Scan SFTP incrémental des metadata.json
+  2. Sync PostgreSQL des sessions/caméras/trackers HDD
+  3. Sync MongoDB -> PostgreSQL :
+       - kafka_sessions
+       - session_stats
+       - operators
+  4. Création de vues BI pour Superset
 
 Variables d'env :
   SFTP_WORKERS    workers SFTP   défaut: 16
   PG_BATCH_SIZE   lignes/INSERT  défaut: 500
   SFTP_MAX_DEPTH  profondeur max défaut: 8
+
+Mongo :
+  MONGO_URI       défaut: mongodb://admin:admin123@100.93.248.105/
+  MONGO_DB        défaut: admin
 """
 
 import argparse
@@ -29,13 +31,16 @@ import posixpath
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from datetime import datetime
+from decimal import Decimal
 from io import BytesIO
 from stat import S_ISDIR
 
 import paramiko
 import psycopg2
 import requests
-from psycopg2.extras import execute_values
+from pymongo import MongoClient
+from psycopg2.extras import execute_values, execute_batch, Json
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -75,6 +80,14 @@ SUPERSET_DB_URI  = os.environ.get(
     "postgresql+psycopg2://superset:superset123@postgres:5432/robotics",
 )
 
+# Mongo
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://admin:admin123@100.93.248.105/")
+MONGO_DB  = os.environ.get("MONGO_DB", "admin")
+
+COLL_KAFKA_SESSIONS = os.environ.get("COLL_KAFKA_SESSIONS", "kafka_sessions")
+COLL_SESSION_STATS  = os.environ.get("COLL_SESSION_STATS", "session_stats")
+COLL_OPERATORS      = os.environ.get("COLL_OPERATORS", "operators")
+
 # ── Connexions SFTP thread-local ──────────────────────────────────────────────
 
 _tlocal = threading.local()
@@ -91,21 +104,78 @@ def _get_sftp() -> paramiko.SFTPClient:
             banner_timeout=15, auth_timeout=15,
         )
         sftp = ssh.open_sftp()
-        sftp.get_channel().in_window_size    = 2 * 1024 * 1024
+        sftp.get_channel().in_window_size = 2 * 1024 * 1024
         sftp.get_channel().in_max_packet_size = 32768
-        _tlocal.ssh  = ssh
+        _tlocal.ssh = ssh
         _tlocal.sftp = sftp
     return _tlocal.sftp
+
+
+# ── Helpers Mongo ─────────────────────────────────────────────────────────────
+
+def mongo_connect():
+    client = MongoClient(MONGO_URI)
+    return client, client[MONGO_DB]
+
+
+def safe_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def safe_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def safe_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "y"):
+            return True
+        if v in ("false", "0", "no", "n"):
+            return False
+    return None
+
+
+def parse_date(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value[:10]
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return None
+
+
+def parse_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
 
 
 # ── Phase 1 : BFS parallèle avec collecte mtime ───────────────────────────────
 
 def _scan_dir(path: str, depth: int) -> tuple[list[tuple[str, int]], list[tuple[str, float]]]:
-    """
-    Retourne :
-      - sous-répertoires à explorer : [(path, depth), ...]
-      - metadata.json trouvés       : [(path, mtime), ...]
-    """
     if depth > SFTP_MAX_DEPTH:
         return [], []
     try:
@@ -114,8 +184,8 @@ def _scan_dir(path: str, depth: int) -> tuple[list[tuple[str, int]], list[tuple[
         log.warning("listdir %s : %s", path, e)
         return [], []
 
-    subdirs: list[tuple[str, int]]    = []
-    metas:   list[tuple[str, float]]  = []
+    subdirs = []
+    metas = []
 
     for entry in entries:
         full = posixpath.join(path, entry.filename)
@@ -130,9 +200,8 @@ def _scan_dir(path: str, depth: int) -> tuple[list[tuple[str, int]], list[tuple[
 
 
 def find_all_metadata_parallel() -> dict[str, list[tuple[str, float]]]:
-    """BFS parallèle → {layer: [(path, mtime), ...]}"""
-    layer_results: dict[str, list[tuple[str, float]]] = {l: [] for l, _ in LAYERS}
-    futures: dict = {}
+    layer_results = {l: [] for l, _ in LAYERS}
+    futures = {}
     dirs_scanned = 0
 
     with ThreadPoolExecutor(max_workers=SFTP_WORKERS, thread_name_prefix="sftp-scan") as ex:
@@ -143,7 +212,7 @@ def find_all_metadata_parallel() -> dict[str, list[tuple[str, float]]]:
 
         while futures:
             done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
-            new_futures: dict = {}
+            new_futures = {}
             for f in done:
                 layer, path = futures.pop(f)
                 dirs_scanned += 1
@@ -173,23 +242,13 @@ def find_all_metadata_parallel() -> dict[str, list[tuple[str, float]]]:
 def filter_new_or_changed(
     layer_results: dict[str, list[tuple[str, float]]]
 ) -> dict[str, list[tuple[str, float]]]:
-    """
-    Compare les mtime scannés avec le cache hdd_scan_cache.
-    Retourne uniquement les fichiers nouveaux ou dont le mtime a changé.
-    """
-    # Tous les chemins à vérifier
-    all_paths = [
-        path
-        for paths in layer_results.values()
-        for path, _ in paths
-    ]
+    all_paths = [path for paths in layer_results.values() for path, _ in paths]
     if not all_paths:
         return {l: [] for l in layer_results}
 
     pg = pg_connect()
     try:
         with pg.cursor() as cur:
-            # Récupère le cache en une seule requête
             cur.execute(
                 "SELECT path, mtime FROM hdd_scan_cache WHERE path = ANY(%s)",
                 (all_paths,)
@@ -198,7 +257,7 @@ def filter_new_or_changed(
     finally:
         pg.close()
 
-    filtered: dict[str, list[tuple[str, float]]] = {}
+    filtered = {}
     total_new = 0
     total_skip = 0
 
@@ -219,7 +278,6 @@ def filter_new_or_changed(
 
 
 def update_scan_cache(processed: list[tuple[str, float]]) -> None:
-    """Met à jour hdd_scan_cache avec les fichiers traités avec succès."""
     if not processed:
         return
     pg = pg_connect()
@@ -240,7 +298,7 @@ def update_scan_cache(processed: list[tuple[str, float]]) -> None:
 
 # ── Phase 2 : lecture parallèle ───────────────────────────────────────────────
 
-def _read_meta(layer: str, path: str, mtime: float) -> tuple[str, str, float, dict] | None:
+def _read_meta(layer: str, path: str, mtime: float):
     try:
         buf = BytesIO()
         _get_sftp().getfo(path, buf)
@@ -253,9 +311,10 @@ def _read_meta(layer: str, path: str, mtime: float) -> tuple[str, str, float, di
         return None
 
 
-def read_metadata_parallel(
-    filtered: dict[str, list[tuple[str, float]]]
-) -> list[tuple[str, str, float, dict]]:
+def read_and_flush_pipeline(
+    filtered: dict[str, list[tuple[str, float]]],
+    flush_size: int = 200,
+) -> tuple[int, list[tuple[str, float]]]:
     all_items = [
         (layer, path, mtime)
         for layer, items in filtered.items()
@@ -263,30 +322,102 @@ def read_metadata_parallel(
     ]
     total = len(all_items)
     if total == 0:
-        return []
+        return 0, []
 
-    results = []
     t0 = time.perf_counter()
-    log.info("Lecture de %d fichiers avec %d workers…", total, SFTP_WORKERS)
+    log.info("Pipeline lecture+INSERT — %d fichiers, workers: %d, flush tous les %d",
+             total, SFTP_WORKERS, flush_size)
 
-    with ThreadPoolExecutor(max_workers=SFTP_WORKERS, thread_name_prefix="sftp-read") as ex:
-        futures = {
-            ex.submit(_read_meta, layer, path, mtime): i
-            for i, (layer, path, mtime) in enumerate(all_items)
-        }
-        for i, f in enumerate(as_completed(futures), start=1):
-            result = f.result()
-            if result is not None:
-                results.append(result)
-            if i % 500 == 0 or i == total:
-                elapsed = time.perf_counter() - t0
-                rate = i / elapsed if elapsed > 0 else 0
-                eta = (total - i) / rate if rate > 0 else 0
-                log.info("  Lecture %d/%d (%.0f%%) — %.0f f/s — ETA %.0fs",
-                         i, total, 100 * i / total, rate, eta)
+    session_buf = []
+    camera_buf = []
+    tracker_buf = []
+    cache_buf = []
 
-    log.info("Lecture terminée en %.1fs — %d/%d lus", time.perf_counter() - t0, len(results), total)
-    return results
+    total_sessions = 0
+    total_cameras = 0
+    total_trackers = 0
+    files_read = 0
+
+    pg = pg_connect()
+    cur = pg.cursor()
+
+    def flush_buffers(force: bool = False) -> None:
+        nonlocal total_sessions, total_cameras, total_trackers
+        if not force and len(session_buf) < flush_size:
+            return
+
+        try:
+            flush_sessions(cur, session_buf)
+            pg.commit()
+            flush_cameras(cur, camera_buf)
+            pg.commit()
+            flush_trackers(cur, tracker_buf)
+            pg.commit()
+
+            update_scan_cache(cache_buf)
+
+            total_sessions += len(session_buf)
+            total_cameras += len(camera_buf)
+            total_trackers += len(tracker_buf)
+
+            log.info("  Flush — %d sessions insérées (total %d), lu %d/%d",
+                     len(session_buf), total_sessions, files_read, total)
+
+            session_buf.clear()
+            camera_buf.clear()
+            tracker_buf.clear()
+            cache_buf.clear()
+
+        except Exception as e:
+            pg.rollback()
+            log.error("Erreur flush : %s", e)
+            raise
+
+    try:
+        with ThreadPoolExecutor(max_workers=SFTP_WORKERS, thread_name_prefix="sftp-read") as ex:
+            futures = {
+                ex.submit(_read_meta, layer, path, mtime): (path, mtime)
+                for layer, path, mtime in all_items
+            }
+            for f in as_completed(futures):
+                files_read += 1
+                result = f.result()
+                if result is None:
+                    continue
+
+                layer, path, mtime, meta = result
+                fallback = posixpath.basename(posixpath.dirname(path))
+                row = parse_metadata(meta, layer, path, fallback)
+                session_id = row["session_id"]
+
+                session_buf.append(row)
+                camera_buf.extend([
+                    (layer, session_id, str(k), c.get("name"), c.get("position"), c.get("serial"))
+                    for k, c in (meta.get("cameras") or {}).items()
+                ])
+                tracker_buf.extend([
+                    (layer, session_id, str(k), t.get("serial"), t.get("model"))
+                    for k, t in (meta.get("trackers") or {}).items()
+                ])
+                cache_buf.append((path, mtime))
+
+                flush_buffers(force=False)
+
+        flush_buffers(force=True)
+        cur.close()
+
+    except Exception:
+        pg.rollback()
+        raise
+    finally:
+        pg.close()
+
+    elapsed = time.perf_counter() - t0
+    rate = total / elapsed if elapsed > 0 else 0
+    log.info("Pipeline terminé en %.1fs — %d sessions, %d caméras, %d trackers (%.0f f/s)",
+             elapsed, total_sessions, total_cameras, total_trackers, rate)
+
+    return total_sessions, []
 
 
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
@@ -296,6 +427,9 @@ def pg_connect():
 
 
 def create_schema(cur) -> None:
+    cur.execute("CREATE SCHEMA IF NOT EXISTS bi")
+    cur.execute("CREATE SCHEMA IF NOT EXISTS staging")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hdd_sessions (
             id               BIGSERIAL PRIMARY KEY,
@@ -341,7 +475,6 @@ def create_schema(cur) -> None:
             CONSTRAINT uq_hdd_trackers UNIQUE (layer, session_id, tracker_key)
         )
     """)
-    # Cache incrémental : évite de relire les fichiers déjà traités
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hdd_scan_cache (
             path      TEXT PRIMARY KEY,
@@ -349,16 +482,81 @@ def create_schema(cur) -> None:
             synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+
+    # Tables Mongo staging
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS staging.mongo_kafka_sessions (
+            session_id TEXT PRIMARY KEY,
+            mongo_id TEXT,
+            station_id TEXT,
+            operator_code TEXT,
+            scenario TEXT,
+            ts_stop DOUBLE PRECISION,
+            duration_s DOUBLE PRECISION,
+            failed BOOLEAN,
+            upload_status TEXT,
+            size_gb DOUBLE PRECISION,
+            session_date DATE,
+            hour INTEGER,
+            month TEXT,
+            raw_doc JSONB,
+            loaded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS staging.mongo_session_stats (
+            session_id TEXT PRIMARY KEY,
+            mongo_id TEXT,
+            station_id TEXT,
+            operator_code TEXT,
+            scenario TEXT,
+            duration_s DOUBLE PRECISION,
+            size_gb DOUBLE PRECISION,
+            failed BOOLEAN,
+            upload_success BOOLEAN,
+            session_date DATE,
+            hour INTEGER,
+            ingested_at TIMESTAMPTZ,
+            raw_doc JSONB,
+            loaded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS staging.mongo_operators (
+            operator_id TEXT PRIMARY KEY,
+            employee_code TEXT,
+            full_name TEXT,
+            username TEXT,
+            password TEXT,
+            role TEXT,
+            site_id TEXT,
+            rig_id TEXT,
+            status TEXT,
+            hourly_cost NUMERIC(12,4),
+            currency TEXT,
+            raw_doc JSONB,
+            loaded_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
     for ddl in [
-        "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_layer      ON hdd_sessions(layer)",
+        "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_layer ON hdd_sessions(layer)",
         "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_session_id ON hdd_sessions(session_id)",
         "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_start_time ON hdd_sessions(start_time)",
-        "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_meta_gin   ON hdd_sessions USING GIN (metadata_json)",
-        "CREATE INDEX IF NOT EXISTS idx_hdd_cameras_layer_sess  ON hdd_cameras(layer, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_hdd_sessions_meta_gin ON hdd_sessions USING GIN (metadata_json)",
+        "CREATE INDEX IF NOT EXISTS idx_hdd_cameras_layer_sess ON hdd_cameras(layer, session_id)",
         "CREATE INDEX IF NOT EXISTS idx_hdd_trackers_layer_sess ON hdd_trackers(layer, session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_kafka_sessions_date ON staging.mongo_kafka_sessions(session_date)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_kafka_sessions_operator ON staging.mongo_kafka_sessions(operator_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_kafka_sessions_station ON staging.mongo_kafka_sessions(station_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_session_stats_date ON staging.mongo_session_stats(session_date)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_session_stats_operator ON staging.mongo_session_stats(operator_code)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_session_stats_station ON staging.mongo_session_stats(station_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mongo_operators_username ON staging.mongo_operators(username)",
     ]:
         cur.execute(ddl)
 
+    # Vue HDD existante
     cur.execute("""
         CREATE OR REPLACE VIEW v_sessions_full AS
         SELECT
@@ -378,6 +576,187 @@ def create_schema(cur) -> None:
             SELECT layer, session_id, COUNT(*) AS trackers_count
             FROM hdd_trackers GROUP BY layer, session_id
         ) t ON t.layer = s.layer AND t.session_id = s.session_id
+    """)
+
+    # Vues BI Mongo + HDD
+    cur.execute("""
+        CREATE OR REPLACE VIEW bi.dim_operators AS
+        SELECT
+            operator_id,
+            employee_code,
+            full_name,
+            username,
+            role,
+            site_id,
+            rig_id,
+            status,
+            hourly_cost,
+            currency
+        FROM staging.mongo_operators
+    """)
+
+    cur.execute("""
+        CREATE OR REPLACE VIEW bi.fact_capture_sessions AS
+        WITH mongo_union AS (
+            SELECT
+                ks.session_id,
+                ks.station_id,
+                ks.operator_code AS operator,
+                ks.scenario,
+                ks.session_date,
+                ks.hour,
+                CASE
+                    WHEN ks.hour BETWEEN 6 AND 13 THEN 'shift_1'
+                    WHEN ks.hour BETWEEN 14 AND 21 THEN 'shift_2'
+                    ELSE 'shift_3'
+                END AS shift,
+                ks.duration_s,
+                ks.duration_s / 3600.0 AS raw_hours,
+                ks.failed,
+                NULL::BOOLEAN AS upload_success,
+                ks.upload_status,
+                ks.size_gb,
+                ks.month,
+                NULL::TIMESTAMPTZ AS ingested_at,
+                'kafka_sessions'::TEXT AS source
+            FROM staging.mongo_kafka_sessions ks
+
+            UNION ALL
+
+            SELECT
+                ss.session_id,
+                ss.station_id,
+                ss.operator_code AS operator,
+                ss.scenario,
+                ss.session_date,
+                ss.hour,
+                CASE
+                    WHEN ss.hour BETWEEN 6 AND 13 THEN 'shift_1'
+                    WHEN ss.hour BETWEEN 14 AND 21 THEN 'shift_2'
+                    ELSE 'shift_3'
+                END AS shift,
+                ss.duration_s,
+                ss.duration_s / 3600.0 AS raw_hours,
+                ss.failed,
+                ss.upload_success,
+                CASE
+                    WHEN ss.upload_success IS TRUE THEN 'success'
+                    WHEN ss.upload_success IS FALSE THEN 'failed'
+                    ELSE NULL
+                END AS upload_status,
+                ss.size_gb,
+                TO_CHAR(ss.session_date, 'YYYY-MM') AS month,
+                ss.ingested_at,
+                'session_stats'::TEXT AS source
+            FROM staging.mongo_session_stats ss
+        ),
+        dedup AS (
+            SELECT *
+            FROM (
+                SELECT
+                    m.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY m.session_id
+                        ORDER BY
+                            CASE WHEN m.source = 'session_stats' THEN 1 ELSE 2 END,
+                            m.ingested_at DESC NULLS LAST
+                    ) AS rn
+                FROM mongo_union m
+            ) x
+            WHERE rn = 1
+        )
+        SELECT
+            d.session_id,
+            d.station_id,
+            d.operator,
+            d.scenario,
+            d.session_date,
+            d.hour,
+            d.shift,
+            d.duration_s,
+            d.raw_hours,
+            d.failed,
+            d.upload_success,
+            d.upload_status,
+            d.size_gb,
+            d.month,
+            d.ingested_at,
+            d.source,
+            o.operator_id,
+            o.employee_code,
+            o.full_name,
+            o.role,
+            o.site_id,
+            o.rig_id,
+            o.status AS operator_status,
+            o.hourly_cost,
+            o.currency,
+            v.start_time,
+            v.end_time,
+            v.trigger_time,
+            v.synced_at,
+            v.duration_seconds AS hdd_duration_seconds,
+            v.layer,
+            v.source_path,
+            v.video_width,
+            v.video_height,
+            v.video_fps,
+            v.metadata_json,
+            v.cameras_count,
+            v.trackers_count,
+            CASE
+                WHEN v.end_time IS NOT NULL AND v.synced_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (v.synced_at - v.end_time)) / 60.0
+                ELSE NULL
+            END AS capture_to_sync_latency_min
+        FROM dedup d
+        LEFT JOIN bi.dim_operators o
+            ON UPPER(d.operator) = UPPER(o.username)
+        LEFT JOIN v_sessions_full v
+            ON d.session_id = v.session_id
+    """)
+
+    cur.execute("""
+        CREATE OR REPLACE VIEW bi.operator_activity_daily AS
+        SELECT
+            session_date,
+            operator,
+            full_name,
+            site_id,
+            rig_id,
+            hourly_cost,
+            COUNT(*) AS sessions_count,
+            SUM(raw_hours) AS raw_hours,
+            SUM(CASE WHEN failed = FALSE THEN raw_hours ELSE 0 END) AS accepted_hours_proxy,
+            AVG(CASE WHEN failed = TRUE THEN 1.0 ELSE 0.0 END) AS failed_rate,
+            AVG(
+                CASE
+                    WHEN upload_success = TRUE OR upload_status = 'success' THEN 1.0
+                    ELSE 0.0
+                END
+            ) AS upload_success_rate,
+            SUM(raw_hours * COALESCE(hourly_cost, 0)) AS labor_cost_proxy
+        FROM bi.fact_capture_sessions
+        GROUP BY session_date, operator, full_name, site_id, rig_id, hourly_cost
+    """)
+
+    cur.execute("""
+        CREATE OR REPLACE VIEW bi.rig_activity_daily AS
+        SELECT
+            session_date,
+            station_id,
+            COUNT(*) AS sessions_count,
+            SUM(raw_hours) AS raw_hours,
+            SUM(CASE WHEN failed = FALSE THEN raw_hours ELSE 0 END) AS accepted_hours_proxy,
+            AVG(CASE WHEN failed = TRUE THEN 1.0 ELSE 0.0 END) AS failed_rate,
+            AVG(
+                CASE
+                    WHEN upload_success = TRUE OR upload_status = 'success' THEN 1.0
+                    ELSE 0.0
+                END
+            ) AS upload_success_rate
+        FROM bi.fact_capture_sessions
+        GROUP BY session_date, station_id
     """)
 
 
@@ -402,12 +781,11 @@ def parse_metadata(meta: dict, layer: str, source_path: str, fallback: str) -> d
     }
 
 
-# ── INSERT batch avec déduplication ──────────────────────────────────────────
+# ── INSERT batch HDD ──────────────────────────────────────────────────────────
 
 def flush_sessions(cur, rows: list[dict]) -> None:
     if not rows:
         return
-    # Déduplique sur (layer, session_id) — garde la dernière occurrence
     deduped = {(r["layer"], r["session_id"]): r for r in rows}
     execute_values(cur, """
         INSERT INTO hdd_sessions (
@@ -440,7 +818,6 @@ def flush_sessions(cur, rows: list[dict]) -> None:
 def flush_cameras(cur, rows: list[tuple]) -> None:
     if not rows:
         return
-    # Déduplique sur (layer, session_id, camera_key)
     deduped = {(r[0], r[1], r[2]): r for r in rows}
     execute_values(cur, """
         INSERT INTO hdd_cameras (layer, session_id, camera_key, name, position, serial)
@@ -456,7 +833,6 @@ def flush_cameras(cur, rows: list[tuple]) -> None:
 def flush_trackers(cur, rows: list[tuple]) -> None:
     if not rows:
         return
-    # Déduplique sur (layer, session_id, tracker_key)
     deduped = {(r[0], r[1], r[2]): r for r in rows}
     execute_values(cur, """
         INSERT INTO hdd_trackers (layer, session_id, tracker_key, serial, model)
@@ -468,84 +844,233 @@ def flush_trackers(cur, rows: list[tuple]) -> None:
     """, list(deduped.values()), page_size=PG_BATCH_SIZE)
 
 
-# ── Sync principal ────────────────────────────────────────────────────────────
+# ── Mongo extract/load ────────────────────────────────────────────────────────
 
-def sync_once() -> int:
-    t0 = time.perf_counter()
+def extract_kafka_sessions(db):
+    docs = list(db[COLL_KAFKA_SESSIONS].find({}))
+    log.info("Mongo %s: %d documents", COLL_KAFKA_SESSIONS, len(docs))
+    out = []
+    for d in docs:
+        out.append({
+            "session_id": d.get("session_id") or str(d.get("_id")),
+            "mongo_id": str(d.get("_id")),
+            "station_id": d.get("station_id"),
+            "operator_code": d.get("operator"),
+            "scenario": d.get("scenario"),
+            "ts_stop": safe_float(d.get("ts_stop")),
+            "duration_s": safe_float(d.get("duration_s")),
+            "failed": safe_bool(d.get("failed")),
+            "upload_status": d.get("upload_status"),
+            "size_gb": safe_float(d.get("size_gb")),
+            "session_date": parse_date(d.get("date")),
+            "hour": safe_int(d.get("hour")),
+            "month": d.get("month"),
+            "raw_doc": d,
+        })
+    return out
 
-    # Phase 1 : scan BFS (rapide — pas de lecture fichier)
-    layer_results = find_all_metadata_parallel()
-    total_found = sum(len(v) for v in layer_results.values())
-    if total_found == 0:
-        log.info("Aucun metadata.json trouvé.")
-        return 0
 
-    # Phase 2 : filtre incrémental (ignore les déjà traités)
-    filtered = filter_new_or_changed(layer_results)
-    total_new = sum(len(v) for v in filtered.values())
-    if total_new == 0:
-        log.info("Aucun fichier nouveau ou modifié — sync ignoré.")
-        return 0
+def extract_session_stats(db):
+    docs = list(db[COLL_SESSION_STATS].find({}))
+    log.info("Mongo %s: %d documents", COLL_SESSION_STATS, len(docs))
+    out = []
+    for d in docs:
+        out.append({
+            "session_id": d.get("session_id") or str(d.get("_id")),
+            "mongo_id": str(d.get("_id")),
+            "station_id": d.get("station_id"),
+            "operator_code": d.get("operator"),
+            "scenario": d.get("scenario"),
+            "duration_s": safe_float(d.get("duration_s")),
+            "size_gb": safe_float(d.get("size_gb")),
+            "failed": safe_bool(d.get("failed")),
+            "upload_success": safe_bool(d.get("upload_success")),
+            "session_date": parse_date(d.get("date")),
+            "hour": safe_int(d.get("hour")),
+            "ingested_at": parse_timestamp(d.get("ingested_at")),
+            "raw_doc": d,
+        })
+    return out
 
-    # Phase 3 : lecture parallèle des seuls fichiers nouveaux
-    parsed = read_metadata_parallel(filtered)
-    if not parsed:
-        log.info("Aucun fichier lu avec succès.")
-        return 0
 
-    # Phase 4 : assemblage + déduplication
-    session_rows: list[dict]  = []
-    camera_rows:  list[tuple] = []
-    tracker_rows: list[tuple] = []
+def extract_operators(db):
+    docs = list(db[COLL_OPERATORS].find({}))
+    log.info("Mongo %s: %d documents", COLL_OPERATORS, len(docs))
+    out = []
+    for d in docs:
+        cost_profile = d.get("cost_profile") or {}
+        out.append({
+            "operator_id": d.get("_id"),
+            "employee_code": d.get("employee_code"),
+            "full_name": d.get("full_name"),
+            "username": d.get("username"),
+            "password": d.get("password"),
+            "role": d.get("role"),
+            "site_id": d.get("site_id"),
+            "rig_id": d.get("rig_id"),
+            "status": d.get("status"),
+            "hourly_cost": Decimal(str(cost_profile.get("hourly_cost"))) if cost_profile.get("hourly_cost") is not None else None,
+            "currency": cost_profile.get("currency"),
+            "raw_doc": d,
+        })
+    return out
 
-    for layer, path, _mtime, meta in parsed:
-        fallback = posixpath.basename(posixpath.dirname(path))
-        row = parse_metadata(meta, layer, path, fallback)
-        session_id = row["session_id"]
-        session_rows.append(row)
-        camera_rows.extend([
-            (layer, session_id, str(k), c.get("name"), c.get("position"), c.get("serial"))
-            for k, c in (meta.get("cameras") or {}).items()
-        ])
-        tracker_rows.extend([
-            (layer, session_id, str(k), t.get("serial"), t.get("model"))
-            for k, t in (meta.get("trackers") or {}).items()
-        ])
 
-    # Phase 5 : batch INSERT PostgreSQL
-    t_pg = time.perf_counter()
-    pg  = pg_connect()
-    cur = pg.cursor()
+def upsert_mongo_kafka_sessions(cur, rows):
+    if not rows:
+        return
+    sql = """
+        INSERT INTO staging.mongo_kafka_sessions (
+            session_id, mongo_id, station_id, operator_code, scenario,
+            ts_stop, duration_s, failed, upload_status, size_gb,
+            session_date, hour, month, raw_doc
+        ) VALUES (
+            %(session_id)s, %(mongo_id)s, %(station_id)s, %(operator_code)s, %(scenario)s,
+            %(ts_stop)s, %(duration_s)s, %(failed)s, %(upload_status)s, %(size_gb)s,
+            %(session_date)s, %(hour)s, %(month)s, %(raw_doc)s
+        )
+        ON CONFLICT (session_id) DO UPDATE SET
+            mongo_id = EXCLUDED.mongo_id,
+            station_id = EXCLUDED.station_id,
+            operator_code = EXCLUDED.operator_code,
+            scenario = EXCLUDED.scenario,
+            ts_stop = EXCLUDED.ts_stop,
+            duration_s = EXCLUDED.duration_s,
+            failed = EXCLUDED.failed,
+            upload_status = EXCLUDED.upload_status,
+            size_gb = EXCLUDED.size_gb,
+            session_date = EXCLUDED.session_date,
+            hour = EXCLUDED.hour,
+            month = EXCLUDED.month,
+            raw_doc = EXCLUDED.raw_doc,
+            loaded_at = NOW()
+    """
+    payload = []
+    for row in rows:
+        r = dict(row)
+        r["raw_doc"] = Json(r["raw_doc"])
+        payload.append(r)
+    execute_batch(cur, sql, payload, page_size=PG_BATCH_SIZE)
+
+
+def upsert_mongo_session_stats(cur, rows):
+    if not rows:
+        return
+    sql = """
+        INSERT INTO staging.mongo_session_stats (
+            session_id, mongo_id, station_id, operator_code, scenario,
+            duration_s, size_gb, failed, upload_success,
+            session_date, hour, ingested_at, raw_doc
+        ) VALUES (
+            %(session_id)s, %(mongo_id)s, %(station_id)s, %(operator_code)s, %(scenario)s,
+            %(duration_s)s, %(size_gb)s, %(failed)s, %(upload_success)s,
+            %(session_date)s, %(hour)s, %(ingested_at)s, %(raw_doc)s
+        )
+        ON CONFLICT (session_id) DO UPDATE SET
+            mongo_id = EXCLUDED.mongo_id,
+            station_id = EXCLUDED.station_id,
+            operator_code = EXCLUDED.operator_code,
+            scenario = EXCLUDED.scenario,
+            duration_s = EXCLUDED.duration_s,
+            size_gb = EXCLUDED.size_gb,
+            failed = EXCLUDED.failed,
+            upload_success = EXCLUDED.upload_success,
+            session_date = EXCLUDED.session_date,
+            hour = EXCLUDED.hour,
+            ingested_at = EXCLUDED.ingested_at,
+            raw_doc = EXCLUDED.raw_doc,
+            loaded_at = NOW()
+    """
+    payload = []
+    for row in rows:
+        r = dict(row)
+        r["raw_doc"] = Json(r["raw_doc"])
+        payload.append(r)
+    execute_batch(cur, sql, payload, page_size=PG_BATCH_SIZE)
+
+
+def upsert_mongo_operators(cur, rows):
+    if not rows:
+        return
+    sql = """
+        INSERT INTO staging.mongo_operators (
+            operator_id, employee_code, full_name, username, password, role,
+            site_id, rig_id, status, hourly_cost, currency, raw_doc
+        ) VALUES (
+            %(operator_id)s, %(employee_code)s, %(full_name)s, %(username)s, %(password)s, %(role)s,
+            %(site_id)s, %(rig_id)s, %(status)s, %(hourly_cost)s, %(currency)s, %(raw_doc)s
+        )
+        ON CONFLICT (operator_id) DO UPDATE SET
+            employee_code = EXCLUDED.employee_code,
+            full_name = EXCLUDED.full_name,
+            username = EXCLUDED.username,
+            password = EXCLUDED.password,
+            role = EXCLUDED.role,
+            site_id = EXCLUDED.site_id,
+            rig_id = EXCLUDED.rig_id,
+            status = EXCLUDED.status,
+            hourly_cost = EXCLUDED.hourly_cost,
+            currency = EXCLUDED.currency,
+            raw_doc = EXCLUDED.raw_doc,
+            loaded_at = NOW()
+    """
+    payload = []
+    for row in rows:
+        r = dict(row)
+        r["raw_doc"] = Json(r["raw_doc"])
+        payload.append(r)
+    execute_batch(cur, sql, payload, page_size=PG_BATCH_SIZE)
+
+
+def sync_mongo_once() -> None:
+    log.info("Début sync MongoDB -> PostgreSQL")
+    client, db = mongo_connect()
+    pg = pg_connect()
     try:
-        for i in range(0, len(session_rows), PG_BATCH_SIZE):
-            flush_sessions(cur, session_rows[i:i + PG_BATCH_SIZE])
-        pg.commit()
+        kafka_sessions = extract_kafka_sessions(db)
+        session_stats = extract_session_stats(db)
+        operators = extract_operators(db)
 
-        for i in range(0, len(camera_rows), PG_BATCH_SIZE):
-            flush_cameras(cur, camera_rows[i:i + PG_BATCH_SIZE])
-        pg.commit()
+        with pg.cursor() as cur:
+            upsert_mongo_operators(cur, operators)
+            upsert_mongo_kafka_sessions(cur, kafka_sessions)
+            upsert_mongo_session_stats(cur, session_stats)
 
-        for i in range(0, len(tracker_rows), PG_BATCH_SIZE):
-            flush_trackers(cur, tracker_rows[i:i + PG_BATCH_SIZE])
         pg.commit()
-
-        cur.close()
+        log.info(
+            "Sync Mongo terminé — operators=%d, kafka_sessions=%d, session_stats=%d",
+            len(operators), len(kafka_sessions), len(session_stats)
+        )
     except Exception:
         pg.rollback()
         raise
     finally:
         pg.close()
+        client.close()
 
-    log.info("INSERT en %.1fs — %d sessions, %d caméras, %d trackers",
-             time.perf_counter() - t_pg,
-             len(session_rows), len(camera_rows), len(tracker_rows))
 
-    # Phase 6 : mise à jour cache (seulement les fichiers insérés avec succès)
-    processed = [(path, mtime) for _, path, mtime, _ in parsed]
-    update_scan_cache(processed)
+# ── Sync principal ────────────────────────────────────────────────────────────
+
+def sync_once() -> int:
+    t0 = time.perf_counter()
+
+    layer_results = find_all_metadata_parallel()
+    total_found = sum(len(v) for v in layer_results.values())
+    if total_found == 0:
+        log.info("Aucun metadata.json trouvé.")
+    else:
+        filtered = filter_new_or_changed(layer_results)
+        total_new = sum(len(v) for v in filtered.values())
+        if total_new == 0:
+            log.info("Aucun fichier nouveau ou modifié — sync HDD ignoré.")
+        else:
+            read_and_flush_pipeline(filtered, flush_size=200)
+
+    # Sync Mongo à chaque exécution
+    sync_mongo_once()
 
     log.info("Sync complet en %.1fs total", time.perf_counter() - t0)
-    return len(session_rows)
+    return 1
 
 
 # ── Superset ──────────────────────────────────────────────────────────────────
@@ -554,8 +1079,10 @@ def register_superset() -> None:
     try:
         sess = requests.Session()
         resp = sess.post(f"{SUPERSET_URL}/api/v1/security/login", json={
-            "username": SUPERSET_USER, "password": SUPERSET_PASS,
-            "provider": "db", "refresh": True,
+            "username": SUPERSET_USER,
+            "password": SUPERSET_PASS,
+            "provider": "db",
+            "refresh": True,
         }, timeout=10)
         resp.raise_for_status()
         token = resp.json().get("access_token")
@@ -575,8 +1102,11 @@ def register_superset() -> None:
 
         if not existing:
             r = sess.post(f"{SUPERSET_URL}/api/v1/database/", headers=headers, timeout=10, json={
-                "database_name": SUPERSET_DB_NAME, "sqlalchemy_uri": SUPERSET_DB_URI,
-                "expose_in_sqllab": True, "allow_run_async": True, "allow_dml": False,
+                "database_name": SUPERSET_DB_NAME,
+                "sqlalchemy_uri": SUPERSET_DB_URI,
+                "expose_in_sqllab": True,
+                "allow_run_async": True,
+                "allow_dml": False,
             })
             db_id = r.json().get("id") if r.status_code in (200, 201) else None
             if not db_id:
@@ -587,17 +1117,37 @@ def register_superset() -> None:
             db_id = existing[0]["id"]
             log.info("Base '%s' déjà présente (id=%s)", SUPERSET_DB_NAME, db_id)
 
-        for table_name in ("hdd_sessions", "hdd_cameras", "hdd_trackers", "v_sessions_full"):
-            ds = sess.get(f"{SUPERSET_URL}/api/v1/dataset/", headers=headers, timeout=10,
+        for schema_name, table_name in [
+            ("public", "hdd_sessions"),
+            ("public", "hdd_cameras"),
+            ("public", "hdd_trackers"),
+            ("public", "v_sessions_full"),
+            ("staging", "mongo_kafka_sessions"),
+            ("staging", "mongo_session_stats"),
+            ("staging", "mongo_operators"),
+            ("bi", "dim_operators"),
+            ("bi", "fact_capture_sessions"),
+            ("bi", "operator_activity_daily"),
+            ("bi", "rig_activity_daily"),
+        ]:
+            ds = sess.get(
+                f"{SUPERSET_URL}/api/v1/dataset/",
+                headers=headers,
+                timeout=10,
                 params={"q": json.dumps({"filters": [{"col": "table_name", "opr": "eq", "val": table_name}]})},
             ).json()
+
             if ds.get("count", 0) == 0:
-                r = sess.post(f"{SUPERSET_URL}/api/v1/dataset/", headers=headers, timeout=10,
-                    json={"database": db_id, "schema": "public", "table_name": table_name})
+                r = sess.post(
+                    f"{SUPERSET_URL}/api/v1/dataset/",
+                    headers=headers,
+                    timeout=10,
+                    json={"database": db_id, "schema": schema_name, "table_name": table_name},
+                )
                 if r.status_code in (200, 201):
-                    log.info("Dataset '%s' enregistré.", table_name)
+                    log.info("Dataset '%s.%s' enregistré.", schema_name, table_name)
                 elif "already exists" not in r.text:
-                    log.warning("Erreur dataset '%s': %s", table_name, r.text)
+                    log.warning("Erreur dataset '%s.%s': %s", schema_name, table_name, r.text)
 
     except Exception as e:
         log.warning("Registration Superset ignorée (%s)", e)
@@ -618,7 +1168,6 @@ def wait_for_superset(max_wait: int = 120) -> None:
 
 
 def ensure_database_ready() -> None:
-    # Crée la base robotics si absente
     admin_dsn = PG_DSN.replace("/robotics", "/superset")
     pg = psycopg2.connect(admin_dsn)
     pg.autocommit = True
@@ -631,7 +1180,6 @@ def ensure_database_ready() -> None:
     finally:
         pg.close()
 
-    # Crée les tables/index
     pg = pg_connect()
     try:
         with pg:
@@ -646,7 +1194,7 @@ def ensure_database_ready() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--watch",    action="store_true")
+    parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args()
 
@@ -662,11 +1210,13 @@ def main() -> None:
         while True:
             try:
                 sync_once()
+                register_superset()
             except Exception as e:
                 log.error("Erreur sync : %s", e)
             time.sleep(args.interval)
     else:
         sync_once()
+        register_superset()
 
 
 if __name__ == "__main__":
