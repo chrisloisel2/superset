@@ -276,7 +276,7 @@ def _hdd_sync_pipeline(flush_size: int = 200) -> int:
             pg.commit()
             # Mise à jour cache dans la même transaction
             execute_values(cur, """
-                INSERT INTO hdd_scan_cache (path, mtime, synced_at) VALUES %s
+                INSERT INTO hdd_scan_cache (path, mtime) VALUES %s
                 ON CONFLICT (path) DO UPDATE SET mtime=EXCLUDED.mtime, synced_at=NOW()
             """, cache_buf, page_size=PG_BATCH_SIZE)
             pg.commit()
